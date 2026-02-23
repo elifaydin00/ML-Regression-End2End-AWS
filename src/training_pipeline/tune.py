@@ -7,6 +7,7 @@ Hyperparameter tuning with Optuna + MLflow.
 """
 
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -62,8 +63,8 @@ def tune_model(
     random_state: int = 42,
 ) -> Tuple[Dict, Dict]:
     """Run Optuna tuning; save best model; return (best_params, best_metrics)."""
-    if tracking_uri:
-        mlflow.set_tracking_uri(tracking_uri)
+    resolved_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
+    mlflow.set_tracking_uri(resolved_uri)
     mlflow.set_experiment(experiment_name)
 
     X_train, y_train, X_eval, y_eval = _load_data(train_path, eval_path, sample_frac, random_state)

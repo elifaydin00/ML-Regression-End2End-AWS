@@ -81,5 +81,9 @@ def validate_data(path: str):
         print("✅ All checks passed!")
 
 if __name__ == "__main__":
-    for split in ["data/raw/train.csv", "data/raw/eval.csv", "data/raw/holdout.csv"]:
+    for split in [
+        "data/processed/feature_engineered_train.csv",
+        "data/processed/feature_engineered_eval.csv",
+        "data/processed/feature_engineered_holdout.csv",
+    ]:
         validate_data(split)

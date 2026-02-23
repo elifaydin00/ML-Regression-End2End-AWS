@@ -15,7 +15,7 @@ from src.inference_pipeline.inference import predict
 # Paths
 # -------------------
 DATA_DIR = Path("data/processed")
-HOLDOUT_PATH = DATA_DIR / "cleaning_holdout.csv"
+HOLDOUT_PATH = Path("data/raw") / "holdout.csv"
 OUTPUT_DIR = Path("data/predictions")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

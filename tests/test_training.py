@@ -6,10 +6,11 @@ from src.training_pipeline.train import train_model
 from src.training_pipeline.eval import evaluate_model
 from src.training_pipeline.tune import tune_model
 
+ROOT = Path(__file__).resolve().parents[1]
 
 # Assumes you already ran feature engineering so the processed CSVs exist.
-TRAIN_PATH = Path("data/processed/feature_engineered_train.csv")
-EVAL_PATH = Path("data/processed/feature_engineered_eval.csv")
+TRAIN_PATH = ROOT / "data" / "processed" / "feature_engineered_train.csv"
+EVAL_PATH = ROOT / "data" / "processed" / "feature_engineered_eval.csv"
 
 # Ensuring we have the same keys in metrics dict.
 def _assert_metrics(m):

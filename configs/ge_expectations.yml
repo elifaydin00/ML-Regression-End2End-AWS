@@ -1,0 +1,49 @@
+# Great Expectations schema expectations for Housing Regression pipeline
+# Used by tests/data_quality.py to validate input data
+
+expectations:
+  # Required non-null columns
+  not_null:
+    - price
+    - city_full
+    - date
+
+  # Numeric range checks
+  ranges:
+    price:
+      min: 1000
+      max: 12000000
+    median_sale_price:
+      min: 0
+      max: 19000000
+    median_list_price:
+      min: 0
+      max: 19000000
+    homes_sold:
+      min: 0
+    pending_sales:
+      min: 0
+    median_dom:
+      min: 0
+      max: 10000
+    avg_sale_to_list:
+      min: 0.0
+      max: 2.0
+    "Total Population":
+      min: 0
+    "Median Age":
+      min: 0
+      max: 120
+    "Median Home Value":
+      min: 0
+
+  # Date range
+  date_range:
+    column: date
+    min: "2010-01-01"
+    max: "2025-12-31"
+
+  # String / format checks
+  string_lengths:
+    zipcode_str:
+      exact: 5

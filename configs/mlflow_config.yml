@@ -1,0 +1,21 @@
+# MLflow configuration for Housing Regression ML pipeline
+# Strategy: SQLite tracking store on EC2 + S3 artifact store (no separate MLflow server)
+
+tracking:
+  # Local SQLite DB on EC2; override via MLFLOW_TRACKING_URI env var
+  uri: "sqlite:///mlflow.db"
+
+artifacts:
+  # S3 artifact store; override via MLFLOW_ARTIFACT_ROOT env var
+  root: "s3://house-forecast/mlflow/artifacts"
+
+experiments:
+  training: "xgboost_housing_training"
+  tuning: "xgboost_optuna_housing"
+
+model_registry:
+  model_name: "housing-price-predictor"
+
+# Environment variable overrides (these take precedence at runtime):
+#   MLFLOW_TRACKING_URI=sqlite:////tmp/mlflow.db
+#   MLFLOW_ARTIFACT_ROOT=s3://house-forecast/mlflow/artifacts

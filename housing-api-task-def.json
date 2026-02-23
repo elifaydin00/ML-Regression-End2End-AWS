@@ -11,7 +11,7 @@
   "containerDefinitions": [
     {
       "name": "housing-api",
-      "image": "261899902410.dkr.ecr.eu-west-2.amazonaws.com/housing-api:latest",
+      "image": "261899902410.dkr.ecr.us-east-1.amazonaws.com/housing-api:latest",
       "essential": true,
       "portMappings": [
         {
@@ -19,11 +19,21 @@
           "protocol": "tcp"
         }
       ],
+      "environment": [
+        {
+          "name": "S3_BUCKET",
+          "value": "house-forecast"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "us-east-1"
+        }
+      ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/housing-api-task-ecs",
-          "awslogs-region": "eu-west-2",
+          "awslogs-region": "us-east-1",
           "awslogs-stream-prefix": "ecs"
         }
       }

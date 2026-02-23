@@ -11,6 +11,7 @@ Inference pipeline for Housing Regression MLE.
 
 from __future__ import annotations
 import argparse
+import logging
 from pathlib import Path
 import pandas as pd
 from joblib import load
@@ -19,18 +20,19 @@ from joblib import load
 from src.feature_pipeline.preprocess import clean_and_merge, drop_duplicates, remove_outliers
 from src.feature_pipeline.feature_engineering import add_date_features, drop_unused_columns
 
+logger = logging.getLogger(__name__)
+
 # ----------------------------
 # Default paths
 # ----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "xgb_best_model.pkl"
+FALLBACK_MODEL = PROJECT_ROOT / "models" / "xgb_model.pkl"
 DEFAULT_FREQ_ENCODER = PROJECT_ROOT / "models" / "freq_encoder.pkl"
 DEFAULT_TARGET_ENCODER = PROJECT_ROOT / "models" / "target_encoder.pkl"
 TRAIN_FE_PATH = PROJECT_ROOT / "data" / "processed" / "feature_engineered_train.csv"
 DEFAULT_OUTPUT = PROJECT_ROOT / "predictions.csv"
-
-print("📂 Inference using project root:", PROJECT_ROOT)
 
 # Load training feature columns (strict schema from training dataset)
 if TRAIN_FE_PATH.exists():
@@ -84,8 +86,14 @@ def predict(
     if TRAIN_FEATURE_COLUMNS is not None:
         df = df.reindex(columns=TRAIN_FEATURE_COLUMNS, fill_value=0)
 
-    # Step 6: Load model & predict
-    model = load(model_path)
+    # Step 6: Load model & predict (with fallback from tuned to baseline)
+    resolved_model_path = Path(model_path)
+    if not resolved_model_path.exists():
+        logger.warning(
+            "Model not found at %s, falling back to %s", resolved_model_path, FALLBACK_MODEL
+        )
+        resolved_model_path = FALLBACK_MODEL
+    model = load(resolved_model_path)
     preds = model.predict(df)
 
     # Step 7: Build output
@@ -102,6 +110,9 @@ def predict(
 # ----------------------------
 # Allows running inference directly from terminal.
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Inference using project root: %s", PROJECT_ROOT)
+
     parser = argparse.ArgumentParser(description="Run inference on new housing data (raw).")
     parser.add_argument("--input", type=str, required=True, help="Path to input RAW CSV file")
     parser.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT), help="Path to save predictions CSV")
@@ -120,4 +131,4 @@ if __name__ == "__main__":
     )
 
     preds_df.to_csv(args.output, index=False)
-    print(f"✅ Predictions saved to {args.output}")
+    logger.info("Predictions saved to %s", args.output)

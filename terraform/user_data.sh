@@ -106,7 +106,7 @@ cd /opt/housing-ml/app
 # Download models from S3 if not present
 if [ ! -f "models/xgb_best_model.pkl" ]; then
     echo "Downloading models from S3..."
-    aws s3 sync "s3://${S3_BUCKET}/models/production/" models/ || true
+    aws s3 sync "s3://$${S3_BUCKET}/models/production/" models/ || true
 fi
 
 # Start API

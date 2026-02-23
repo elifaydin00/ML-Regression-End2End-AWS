@@ -377,7 +377,6 @@ resource "aws_lambda_function" "trigger_training" {
     variables = {
       INSTANCE_ID = aws_instance.ml_instance.id
       S3_BUCKET   = aws_s3_bucket.ml_bucket.bucket
-      AWS_REGION  = var.aws_region
     }
   }
 

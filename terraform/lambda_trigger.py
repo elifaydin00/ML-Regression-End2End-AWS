@@ -13,7 +13,7 @@ def handler(event, context):
 
     instance_id = os.environ['INSTANCE_ID']
     s3_bucket = os.environ['S3_BUCKET']
-    aws_region = os.environ['AWS_REGION']
+    aws_region = os.environ['AWS_REGION']  # set automatically by Lambda runtime
 
     print(f"🚀 Triggering training on EC2 instance: {instance_id}")
 

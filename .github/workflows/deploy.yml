@@ -37,7 +37,7 @@ jobs:
             PING=$(aws ssm describe-instance-information \
               --filters "Key=InstanceIds,Values=${{ secrets.EC2_INSTANCE_ID }}" \
               --query 'InstanceInformationList[0].PingStatus' \
-              --output text 2>/dev/null || echo "None")
+              --output text) || { echo "SSM API call failed (check IAM permissions)"; sleep 10; continue; }
             echo "SSM ping: $PING (attempt $i/24)"
             [ "$PING" = "Online" ] && { echo "SSM ready"; exit 0; }
             sleep 10

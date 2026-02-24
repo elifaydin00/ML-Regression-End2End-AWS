@@ -110,7 +110,7 @@ def predict_batch(data: List[HousingRecord]):
     if not MODEL_PATH.exists():
         return {"error": f"Model not found at {str(MODEL_PATH)}"}
 
-    df = pd.DataFrame([record.model_dump() for record in data])
+    df = pd.DataFrame([record.model_dump(exclude_none=True) for record in data])
     if df.empty:
         return {"error": "No data provided"}
 

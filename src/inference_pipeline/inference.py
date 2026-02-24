@@ -94,6 +94,8 @@ def predict(
         )
         resolved_model_path = FALLBACK_MODEL
     model = load(resolved_model_path)
+    mf = model.get_booster().feature_names
+    df = df.reindex(columns=mf, fill_value=0)
     preds = model.predict(df)
 
     # Step 7: Build output

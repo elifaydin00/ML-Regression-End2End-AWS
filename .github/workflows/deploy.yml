@@ -1,0 +1,104 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Start EC2 if stopped
+        run: |
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)
+          echo "Instance state: $STATE"
+          if [ "$STATE" = "stopped" ]; then
+            echo "Starting instance..."
+            aws ec2 start-instances --instance-ids "${{ secrets.EC2_INSTANCE_ID }}"
+            aws ec2 wait instance-running --instance-ids "${{ secrets.EC2_INSTANCE_ID }}"
+            echo "Instance is running"
+          fi
+
+      - name: Wait for SSM agent to be online
+        run: |
+          for i in $(seq 1 24); do
+            PING=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${{ secrets.EC2_INSTANCE_ID }}" \
+              --query 'InstanceInformationList[0].PingStatus' \
+              --output text 2>/dev/null || echo "None")
+            echo "SSM ping: $PING (attempt $i/24)"
+            [ "$PING" = "Online" ] && { echo "SSM ready"; exit 0; }
+            sleep 10
+          done
+          echo "SSM agent did not come online" && exit 1
+
+      - name: Build and send deploy command
+        id: deploy
+        env:
+          REPO_URL: "https://${{ secrets.GH_PAT }}@github.com/elifaydin00/ML-Regression-End2End-AWS.git"
+        run: |
+          python3 - << 'PYEOF'
+          import json, os
+          cmds = [
+              "git -C /opt/housing-ml/app remote set-url origin " + os.environ["REPO_URL"],
+              "git -C /opt/housing-ml/app pull origin main",
+              'sudo -u ec2-user bash -c "cd /opt/housing-ml/app && /home/ec2-user/.local/bin/uv sync --quiet"',
+              "sudo systemctl restart housing-ml-api",
+              "sleep 5",
+              "systemctl is-active housing-ml-api && echo DEPLOY_OK",
+          ]
+          with open("/tmp/cmds.json", "w") as f:
+              json.dump({"commands": cmds}, f)
+          print("Deploy commands prepared")
+          PYEOF
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/cmds.json \
+            --comment "Deploy ${{ github.sha }}" \
+            --query 'Command.CommandId' \
+            --output text)
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "SSM Command ID: $COMMAND_ID"
+
+      - name: Wait for deployment to complete
+        run: |
+          ID="${{ steps.deploy.outputs.command_id }}"
+          INSTANCE="${{ secrets.EC2_INSTANCE_ID }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$ID" \
+              --instance-id "$INSTANCE" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+            echo "Deployment status: $STATUS (attempt $i/30)"
+            if [ "$STATUS" = "Success" ]; then
+              echo "--- Output ---"
+              aws ssm get-command-invocation \
+                --command-id "$ID" --instance-id "$INSTANCE" \
+                --query 'StandardOutputContent' --output text
+              echo "Deployment successful!"
+              exit 0
+            elif [[ "$STATUS" = "Failed" || "$STATUS" = "TimedOut" || "$STATUS" = "Cancelled" ]]; then
+              echo "--- Error ---"
+              aws ssm get-command-invocation \
+                --command-id "$ID" --instance-id "$INSTANCE" \
+                --query 'StandardErrorContent' --output text
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for deployment" && exit 1

@@ -13,9 +13,13 @@ dist/
 wheels/
 
 # Virtual environments
+venv/
 .venv/
 .env/
 *.env
+
+# Test cache
+.pytest_cache/
 
 # ==========================================
 # Project-specific ignores

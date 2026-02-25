@@ -56,3 +56,16 @@ Thumbs.db
 *.pid
 *.tar
 *.lock.json
+
+# Terraform — never commit these
+terraform/terraform.tfvars
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+
+# MLflow local database
+mlflow.db
+
+# Local EC2 scripts (generated files)
+run_training.sh

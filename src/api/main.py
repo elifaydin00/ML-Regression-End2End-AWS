@@ -24,12 +24,11 @@ s3 = boto3.client("s3", region_name=REGION)
 # Ensures your app always has the latest model/data locally,
 # but avoids re-downloading every time it starts.
 def load_from_s3(key, local_path):
-    """Download from S3 if not already cached locally."""
+    """Download from S3, always fetching the latest version."""
     local_path = Path(local_path)
-    if not local_path.exists():
-        os.makedirs(local_path.parent, exist_ok=True)
-        logger.info("Downloading %s from S3...", key)
-        s3.download_file(S3_BUCKET, key, str(local_path))
+    os.makedirs(local_path.parent, exist_ok=True)
+    logger.info("Downloading %s from S3...", key)
+    s3.download_file(S3_BUCKET, key, str(local_path))
     return str(local_path)
 
 # ----------------------------

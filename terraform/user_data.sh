@@ -120,7 +120,7 @@ chmod +x /opt/housing-ml/run_api.sh
 
 cat > /opt/housing-ml/run_training.sh <<'SCRIPT'
 #!/bin/bash
-# Run model training
+# Run full training pipeline: feature engineering → tune → upload → restart API
 
 export USE_S3=true
 export S3_BUCKET=S3_BUCKET_PLACEHOLDER
@@ -131,15 +131,29 @@ export PYTHONPATH=/opt/housing-ml/app
 
 cd /opt/housing-ml/app
 
-echo "Starting model training at $(date)" >> /var/log/housing-ml/training.log
+echo "Starting training pipeline at $(date)" >> /var/log/housing-ml/training.log
 
-# Run full training pipeline
+# Feature pipeline
 /opt/housing-ml/app/.venv/bin/python src/feature_pipeline/load.py >> /var/log/housing-ml/training.log 2>&1
 /opt/housing-ml/app/.venv/bin/python src/feature_pipeline/preprocess.py >> /var/log/housing-ml/training.log 2>&1
 /opt/housing-ml/app/.venv/bin/python src/feature_pipeline/feature_engineering.py >> /var/log/housing-ml/training.log 2>&1
-/opt/housing-ml/app/.venv/bin/python src/training_pipeline/train.py >> /var/log/housing-ml/training.log 2>&1
+
+# Tune: Optuna finds best params, retrains best model, saves models/xgb_best_model.pkl
+/opt/housing-ml/app/.venv/bin/python src/training_pipeline/tune.py >> /var/log/housing-ml/training.log 2>&1
+
+# Upload tuned model to S3 under the key the API reads at startup
+aws s3 cp models/xgb_best_model.pkl \
+    s3://${S3_BUCKET}/models/production/xgb_model_latest.pkl >> /var/log/housing-ml/training.log 2>&1
+
+# Clear local cache so API downloads fresh model on restart
+rm -f /opt/housing-ml/app/models/xgb_best_model.pkl
 
 echo "Training completed at $(date)" >> /var/log/housing-ml/training.log
+
+# Restart API — startup event pulls new model from S3
+sudo systemctl restart housing-ml-api
+
+echo "API restarted with new model at $(date)" >> /var/log/housing-ml/training.log
 SCRIPT
 
 sed -i "s/S3_BUCKET_PLACEHOLDER/$S3_BUCKET/g" /opt/housing-ml/run_training.sh

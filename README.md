@@ -86,15 +86,28 @@ uv run python src/feature_pipeline/preprocess.py
 # 3. Feature engineering (saves encoders to models/)
 uv run python src/feature_pipeline/feature_engineering.py
 
-# 4. Train model (saves xgb_model.pkl to models/)
-uv run python src/training_pipeline/train.py
-
-# 5. Optional: hyperparameter tuning
+# 4. Hyperparameter tuning with Optuna + MLflow
+#    Runs 15 trials, finds best params, retrains final model
+#    Saves best model to models/xgb_best_model.pkl
 uv run python src/training_pipeline/tune.py
 
-# 6. Evaluate on holdout set
+# 5. Evaluate on holdout set
 uv run python src/training_pipeline/eval.py
 ```
+
+### View MLflow Experiment Results
+
+After running `tune.py`, view all trials and compare metrics in the MLflow UI:
+
+```powershell
+.\.venv\Scripts\mlflow.exe ui --backend-store-uri sqlite:///mlflow.db --workers 1
+# Open http://127.0.0.1:5000
+```
+
+You will see:
+- All 15 Optuna trials as nested runs under experiment `xgboost_optuna_housing`
+- Metrics per trial: RMSE, MAE, R²
+- Best model run (`best_xgb_model`) with winning hyperparameters logged
 
 ### Run the API Locally
 
@@ -216,12 +229,40 @@ push to main → start EC2 if stopped → wait for SSM → git pull + uv sync + 
 
 ## Automated Monthly Retraining
 
-EventBridge fires on the 1st of every month at 2 AM UTC → triggers Lambda → Lambda sends SSM command to EC2 → EC2 runs full training pipeline → new model uploaded to S3.
+EventBridge fires on the 1st of every month at 2 AM UTC → Lambda → SSM → EC2 runs the full pipeline:
+
+```
+feature pipeline → tune.py (15 Optuna trials, MLflow tracking)
+  → best params selected → model retrained → xgb_best_model.pkl
+  → uploaded to s3://house-forecast/models/production/xgb_model_latest.pkl
+  → local cache cleared → housing-ml-api restarted
+  → API startup downloads fresh tuned model from S3
+  → /predict serves inference with the new model
+```
+
+**S3 layout after each monthly run:**
+```
+s3://house-forecast/
+├── models/
+│   ├── production/
+│   │   └── xgb_model_latest.pkl        ← overwritten (API reads this)
+│   └── versions/
+│       └── YYYY-MM/                    ← archived for rollback
+│           └── xgb_best_model.pkl
+└── mlflow/
+    └── artifacts/xgboost_optuna_housing/
+        └── <run_id>/model/             ← each trial's serialised model
+```
 
 **Trigger manually:**
 ```powershell
-aws lambda invoke --function-name housing-trigger-training-production response.json
+aws lambda invoke --function-name housing-trigger-training-production --region us-east-1 response.json
 Get-Content response.json
+```
+
+**Watch training logs:**
+```powershell
+aws logs tail /ec2/housing-ml --follow --region us-east-1
 ```
 
 ---
@@ -267,7 +308,9 @@ sudo journalctl -u housing-ml-api -f
 
 **S3 for model storage** — Models persist independently of EC2 lifecycle. Any service can access them. Built-in versioning.
 
-**MLflow with SQLite** — No separate MLflow server needed. Experiment tracking stored in `/tmp/mlflow.db` on EC2, artifacts in S3.
+**Optuna + MLflow for hyperparameter tuning** — Optuna explores 9-dimensional hyperparameter space over 15 trials, minimising RMSE. Every trial is logged to MLflow (SQLite backend locally, S3 artifacts on EC2). The best parameters are used to retrain the final model — this tuned model is what serves production inference, not a baseline with hardcoded defaults.
+
+**MLflow with SQLite** — No separate MLflow server needed. Experiment tracking stored in `mlflow.db` locally and `/tmp/mlflow.db` on EC2, artifacts in S3. View results with `mlflow ui --backend-store-uri sqlite:///mlflow.db --workers 1`.
 
 ---
 

@@ -65,6 +65,12 @@ def tune_model(
     """Run Optuna tuning; save best model; return (best_params, best_metrics)."""
     resolved_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
     mlflow.set_tracking_uri(resolved_uri)
+
+    artifact_location = os.getenv("MLFLOW_ARTIFACT_ROOT")
+    try:
+        mlflow.create_experiment(experiment_name, artifact_location=artifact_location)
+    except Exception:
+        pass  # experiment already exists
     mlflow.set_experiment(experiment_name)
 
     X_train, y_train, X_eval, y_eval = _load_data(train_path, eval_path, sample_frac, random_state)

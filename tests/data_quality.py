@@ -82,8 +82,8 @@ def validate_data(path: str):
 
 if __name__ == "__main__":
     for split in [
-        "data/processed/feature_engineered_train.csv",
-        "data/processed/feature_engineered_eval.csv",
-        "data/processed/feature_engineered_holdout.csv",
+        "data/processed/cleaning_train.csv",
+        "data/processed/cleaning_eval.csv",
+        "data/processed/cleaning_holdout.csv",
     ]:
         validate_data(split)

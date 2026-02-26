@@ -53,14 +53,14 @@ def test_eval_works_with_saved_model(tmp_path):
 # TUNE: Runs tune_model with only 2 trials (fast for CI).
 def test_tune_saves_best_model(tmp_path):
     model_out = tmp_path / "xgb_best.pkl"
-    tracking_dir = tmp_path / "mlruns"
+    tracking_uri = f"sqlite:///{tmp_path}/mlflow_test.db"
     best_params, best_metrics = tune_model(
         train_path=TRAIN_PATH,
         eval_path=EVAL_PATH,
         model_output=model_out,
         n_trials=2,
         sample_frac=0.02,
-        tracking_uri=str(tracking_dir),
+        tracking_uri=tracking_uri,
         experiment_name="test_xgb_optuna",
     )
     assert model_out.exists()

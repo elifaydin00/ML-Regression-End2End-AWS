@@ -10,9 +10,9 @@
 **Data**: Redfin housing market data (`HouseTS.csv`) — monthly median sale prices by zip code across the US
 **Model**: XGBoost regression, predicts median market sale price per zip code
 **Stack**: Python 3.11, XGBoost, FastAPI, Pydantic v2, MLflow (SQLite), Optuna, uv
-**Deployment**: AWS EC2 t2.micro + systemd (NOT Docker/ECS/Fargate)
-**Infrastructure**: Terraform (EC2, S3, Lambda, EventBridge, IAM, CloudWatch, Elastic IP)
-**CI/CD**: GitHub Actions + AWS SSM (push to main → auto-deploy to EC2)
+**Deployment**: API on EC2 t2.micro + systemd; Training in Docker container on ephemeral EC2 (ECR image)
+**Infrastructure**: Terraform (EC2, S3, ECR, Lambda, EventBridge, IAM, CloudWatch, Elastic IP)
+**CI/CD**: GitHub Actions — builds Docker image → pushes to ECR → deploys API to EC2 via SSM
 **Status**: Fully deployed and operational
 
 ---
@@ -35,14 +35,19 @@
 ## Architecture
 
 ```
-git push → GitHub Actions → AWS SSM → EC2 (deploy)
+git push → GitHub Actions → (1) build Docker image → push to ECR
+                          → (2) SSM → EC2 (deploy API code + restart service)
 
-EventBridge (1st of month, 2AM UTC) → Lambda → SSM → EC2 (retrain)
+EventBridge (1st of month, 2AM UTC) → Lambda → ec2.run_instances (ephemeral t2.small)
+  → ephemeral EC2 boots → docker pull ECR image → docker run training container
+  → container: load → preprocess → feature_eng → tune (15 Optuna trials, MLflow)
+  → aws s3 cp models → SSM restart API EC2 → ephemeral EC2 terminates
 
 User → POST /predict → FastAPI (EC2:8000) → inference.py → XGBoost → prediction
 
-EC2 ←→ S3 (house-forecast): read model on startup, write new model after training
-EC2 → CloudWatch (/ec2/housing-ml): API logs + training logs
+API EC2 ←→ S3 (house-forecast): read model on startup (always fresh from S3)
+ECR repo: housing-ml-training (stores versioned Docker training images)
+CloudWatch /ec2/housing-ml: API logs (stream: api) + training container logs (stream: training-container)
 ```
 
 ---
@@ -68,14 +73,21 @@ src/
 └── data/
     └── upload_to_s3.py          # Sync models/ and data/ to S3
 
+Dockerfile                       # Training image: python:3.11-slim + AWS CLI + uv; ENTRYPOINT train_entrypoint.sh
+train_entrypoint.sh              # Container entrypoint: runs all 4 pipeline stages + S3 upload + SSM API restart
+
 terraform/
-├── main.tf                      # All AWS resources
-├── user_data.sh                 # EC2 init script (templatefile with s3_bucket, aws_region, etc.)
-├── lambda_trigger.py            # Lambda handler: check EC2 → start if needed → SSM send-command
-├── build_lambda.ps1             # Windows: zip lambda_trigger.py → lambda_trigger.zip
-├── build_lambda.sh              # Linux/Mac equivalent
+├── main.tf                      # All AWS resources (EC2, S3, ECR, Lambda, IAM, EventBridge, CloudWatch, SG)
+├── user_data.sh                 # EC2 (API) init script (templatefile with s3_bucket, aws_region, etc.)
+├── lambda_trigger.py            # Lambda handler: ec2.run_instances ephemeral training EC2 with Docker user_data
+├── build_zip.py                 # Rebuild lambda_trigger.zip (Python, works on Windows without zip CLI)
+├── lambda_trigger.zip           # Zipped Lambda deployment package (index.py = lambda_trigger.py)
 ├── terraform.tfstate            # CRITICAL — never delete, tracks created resources
 └── terraform.tfvars             # Variable values (git-ignored)
+
+scripts/
+├── deploy_ec2.sh                # Bootstrap-aware EC2 deploy script (sent via SSM, base64-encoded)
+└── verify_aws_setup.py          # Checks AWS credentials, S3, EC2 access
 
 tests/
 ├── test_features.py
@@ -91,8 +103,6 @@ configs/
 ├── mlflow_config.yml
 └── ge_expectations.yml
 
-scripts/
-└── verify_aws_setup.py          # Checks AWS credentials, S3, EC2 access
 ```
 
 ---
@@ -119,29 +129,49 @@ scripts/
 - Input: `data/raw/holdout.csv` (raw data from `load.py`) — NOT `data/processed/cleaning_holdout.csv`
 - `predict()` handles preprocessing internally
 
+### Docker Training Image (`Dockerfile` + `train_entrypoint.sh`)
+
+- Base: `python:3.11-slim` + AWS CLI v2 + uv
+- `ENV PYTHONUNBUFFERED=1` — required for real-time CloudWatch log streaming
+- `ENV PYTHONPATH=/app`
+- Entrypoint: `train_entrypoint.sh` runs all 4 stages + `aws s3 cp` models + SSM restart to API EC2
+- Built by GitHub Actions on every push to `main`, tagged `:latest` and `:<git-sha>`, pushed to ECR
+
+### Lambda (`terraform/lambda_trigger.py`)
+
+- Uses `ec2.run_instances()` — launches fresh ephemeral t2.small EC2, NOT SSM to persistent EC2
+- user_data: installs Docker + SSM agent, pulls ECR image, runs container, self-terminates via `shutdown -h now`
+- Boot log captured to file, uploaded to `s3://house-forecast/logs/` via `trap EXIT` for debugging
+- Container logs streamed to CloudWatch via `--log-driver=awslogs`
+- `InstanceInitiatedShutdownBehavior='terminate'` — EC2 disappears from console after training
+- `BlockDeviceMappings`: 20GB gp3 (default 8GB is too small for Docker + image)
+- Rebuild zip: `cd terraform && uv run python build_zip.py`
+- Lambda environment: `S3_BUCKET`, `ECR_IMAGE_URI`, `INSTANCE_PROFILE_NAME`, `SECURITY_GROUP_ID`, `SUBNET_ID`, `AMI_ID`, `API_INSTANCE_ID`
+- Does NOT set `AWS_REGION` (reserved by Lambda runtime)
+
 ### Terraform (`terraform/main.tf`)
 
-- EC2 has `iam_instance_profile` with `AmazonSSMManagedInstanceCore` + S3 access + CloudWatch logs
-- Lambda IAM policy includes `ec2:StartInstances` (needed by `lambda_trigger.py`)
+- API EC2 has `iam_instance_profile` with `AmazonSSMManagedInstanceCore` + S3 + CloudWatch + ECR pull + SSM SendCommand
+- Lambda IAM policy: `ec2:RunInstances`, `ec2:CreateTags`, `iam:PassRole` (EC2 role ARN), CloudWatch logs
+- ECR repo: `aws_ecr_repository "training"` → `housing-ml-training`
+- `source_code_hash = filebase64sha256(...)` on Lambda resource — forces Lambda update when zip changes
 - `github_repo_url` is a required variable (no default)
-- Lambda environment: does NOT set `AWS_REGION` (reserved by Lambda runtime)
 
-### EC2 Setup
+### EC2 Setup (API — persistent)
 
 - App location: `/opt/housing-ml/app/`
 - API script: `/opt/housing-ml/run_api.sh`
-- Training script: `/opt/housing-ml/run_training.sh`
 - systemd service: `/etc/systemd/system/housing-ml-api.service`
 - Python via uv: `/home/ec2-user/.local/bin/uv`
 - venv: `/opt/housing-ml/app/.venv/`
+- Bootstrap + deploy handled by `scripts/deploy_ec2.sh` (sent via SSM, base64-encoded)
 
-### CI/CD (`github/workflows/deploy.yml`)
+### CI/CD (`.github/workflows/deploy.yml`)
 
-- Triggers on push to `main`
-- Uses `aws-actions/configure-aws-credentials@v4`
-- Starts EC2 if stopped, waits for SSM agent ping = "Online"
-- Deploy command via `AWS-RunShellScript`: git remote set-url (with GH_PAT), git pull, uv sync as ec2-user, systemctl restart
-- SSM check does NOT use `2>/dev/null` so real errors are visible
+- **Job 1 `build-and-push`**: checkout → configure AWS → login to ECR → docker build → tag + push `:latest` and `:<git-sha>`
+- **Job 2 `deploy`** (needs `build-and-push`): start EC2 if stopped → wait SSM online → send `scripts/deploy_ec2.sh` base64-encoded via SSM
+- `deploy_ec2.sh`: detects fresh EC2 (no `.git` dir) → clone + full bootstrap; else `sudo -u ec2-user git pull` + `uv sync` + `systemctl restart`
+- All git commands run as `ec2-user` (directory owned by ec2-user, SSM runs as root — must `sudo -u ec2-user`)
 
 ---
 
@@ -149,16 +179,18 @@ scripts/
 
 | Resource | Name | Purpose |
 |----------|------|---------|
-| EC2 Instance | Housing ML Instance | Runs FastAPI + training |
-| IAM Role | housing-ec2-ml-role-production | EC2 identity (S3 + SSM + CloudWatch) |
-| IAM Instance Profile | housing-ec2-ml-profile-production | Attaches role to EC2 |
-| S3 Bucket | house-forecast | Model + data storage |
-| Lambda Function | housing-trigger-training-production | Monthly training trigger |
-| IAM Role | housing-lambda-training-role-production | Lambda identity |
+| EC2 Instance (persistent) | Housing ML Instance | Runs FastAPI API 24/7 |
+| EC2 Instance (ephemeral) | housing-ml-training-ephemeral | Launched by Lambda for training, self-terminates |
+| ECR Repository | housing-ml-training | Stores versioned Docker training images |
+| IAM Role | housing-ec2-ml-role-production | EC2 identity (S3 + SSM + CloudWatch + ECR pull + SSM SendCommand) |
+| IAM Instance Profile | housing-ec2-ml-profile-production | Attaches role to both persistent and ephemeral EC2 |
+| S3 Bucket | house-forecast | Model + data + logs storage |
+| Lambda Function | housing-trigger-training-production | Monthly training trigger (launches ephemeral EC2) |
+| IAM Role | housing-lambda-training-role-production | Lambda identity (ec2:RunInstances + iam:PassRole) |
 | EventBridge Rule | housing-training-schedule-production | Cron: 1st of month 2AM UTC |
-| CloudWatch Log Group | /ec2/housing-ml | API + training logs |
-| Security Group | housing-ml-ec2-sg-production | Ports 22, 80, 8000 open |
-| Elastic IP | (attached to EC2) | Static IP: 44.219.159.59 |
+| CloudWatch Log Group | /ec2/housing-ml | API logs (stream: api) + training container logs (stream: training-container) |
+| Security Group | housing-ml-ec2-sg-production | Ports 22, 80, 8000 open (shared by API + ephemeral EC2) |
+| Elastic IP | (attached to API EC2) | Static IP: 44.219.159.59 |
 | Key Pair | housing-ml-key | SSH access |
 
 ---
@@ -180,15 +212,17 @@ scripts/
 
 | Removed | Reason |
 |---------|--------|
-| `Dockerfile`, `Dockerfile.train`, `Dockerfile.streamlit` | Project uses EC2+systemd, not Docker/ECS |
+| `Dockerfile.train`, `Dockerfile.streamlit` | Replaced by single `Dockerfile` (training image only) |
 | `housing-api-task-def.json`, `training-task-def.json` | ECS task definitions, deployment path not used |
-| `scripts/deploy_to_ec2.ps1`, `deploy_to_ec2.sh` | Replaced by GitHub Actions CI/CD |
-| `scripts/build_and_push.sh` | Docker/ECR script, not used |
-| `scripts/download_models.sh` | Only referenced by Dockerfile (deleted) |
-| `scripts/quickstart.sh` | Outdated, didn't reflect actual setup |
+| `scripts/deploy_to_ec2.ps1`, `deploy_to_ec2.sh` | Replaced by GitHub Actions + `scripts/deploy_ec2.sh` via SSM |
+| `scripts/build_and_push.sh` | Replaced by GitHub Actions `build-and-push` job |
+| `scripts/download_models.sh` | Not used |
+| `scripts/quickstart.sh` | Outdated |
 | `scripts/setup_aws_credentials.ps1`, `setup_s3_integration.ps1` | One-time setup scripts, already done |
+| `terraform/build_lambda.ps1`, `build_lambda.sh` | Replaced by `terraform/build_zip.py` (cross-platform) |
 | `app.py` | Streamlit UI, not relevant to AI Engineering focus |
 | `src/housing_regression_mle.egg-info/` | Auto-generated by pip install -e |
+| `s3://house-forecast/models/production/xgb_best_model_latest.pkl` | Old naming convention, replaced by `xgb_model_latest.pkl` |
 
 ---
 
@@ -198,141 +232,28 @@ scripts/
 # Check API health
 Invoke-RestMethod http://44.219.159.59:8000/health
 
-# Trigger training manually
+# Trigger training manually (Lambda → ephemeral EC2 → Docker)
 aws lambda invoke --function-name housing-trigger-training-production response.json
 
-# View live logs
+# View live logs (includes training-container stream when training runs)
 aws logs tail /ec2/housing-ml --follow --region us-east-1
 
-# SSH into EC2
+# Verify models in S3 after training
+aws s3 ls s3://house-forecast/models/production/
+
+# Rebuild Lambda zip after changing lambda_trigger.py
+cd terraform && uv run python build_zip.py && cd ..
+# Then: terraform apply -target="aws_lambda_function.trigger_training"
+
+# SSH into API EC2
 ssh -i ~/.ssh/housing-ml-key.pem ec2-user@44.219.159.59
 
 # Check systemd service on EC2
 sudo systemctl status housing-ml-api
 sudo journalctl -u housing-ml-api -f
 
-# Deploy code (just push to GitHub)
+# Deploy code (push to GitHub → Actions builds Docker image + deploys API)
 git push origin main
-```
-
----
-
-## Next Steps — Levelling Up (Docker + Ephemeral EC2)
-
-> Goal: mimic the GE Aerospace production pattern where Lambda spins up a fresh EC2,
-> runs training inside a Docker container, uploads to S3, and terminates.
-> Do these in order — each step is independently deployable and useful.
-
----
-
-### Week 1 — Dockerise the Training Pipeline
-
-**What to build:**
-- Write a `Dockerfile` in the project root that containerises `tune.py`
-- Confirm training runs identically inside the container as it does locally
-
-**Files to create/change:**
-- `Dockerfile` (new) — base image `python:3.11-slim`, copy code, install deps via `uv`, entrypoint runs `tune.py`
-- Test locally: `docker build -t housing-ml-train . && docker run housing-ml-train`
-
-**What you'll learn:**
-- How Docker freezes an environment (why GE uses it for 1000+ parts)
-- The difference between `COPY`, `RUN`, `CMD`, `ENTRYPOINT`
-- Why `python:3.11-slim` not `python:3.11` (image size matters for pull time on EC2)
-
-**Interview talking point:**
-> "I containerised the training pipeline so the environment is identical every run —
-> same Python version, same library versions, no dependency drift between months."
-
----
-
-### Week 2 — Push Image to ECR
-
-**What to build:**
-- Create an ECR repository via Terraform (add to `terraform/main.tf`)
-- Add a GitHub Actions job that builds and pushes the Docker image to ECR on push to main
-
-**Files to change:**
-- `terraform/main.tf` — add `aws_ecr_repository` resource
-- `.github/workflows/deploy.yml` — add build + push step before the EC2 deploy step
-
-**Commands to understand:**
-```bash
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
-docker build -t housing-ml-train .
-docker tag housing-ml-train:latest <account>.dkr.ecr.us-east-1.amazonaws.com/housing-ml-train:latest
-docker push <account>.dkr.ecr.us-east-1.amazonaws.com/housing-ml-train:latest
-```
-
-**What you'll learn:**
-- ECR is just a private Docker registry inside AWS — same as DockerHub but with IAM auth
-- Why IAM role on EC2 allows pulling from ECR without credentials
-- Image tagging strategy (`:latest` vs `:YYYY-MM` for versioning)
-
-**Interview talking point:**
-> "The training image lives in ECR. EC2 pulls it at runtime — the code and environment
-> travel together as a single versioned artifact."
-
----
-
-### Week 3 — Lambda Spins Up Ephemeral EC2
-
-**What to build:**
-- Rewrite `terraform/lambda_trigger.py` to launch a NEW EC2 instance instead of SSM to the existing one
-- EC2 user_data: pull image from ECR, `docker run`, upload model to S3, `sudo shutdown`
-- Existing API EC2 is untouched — training and serving are fully separated
-
-**Key change in Lambda:**
-```python
-# Current (SSM to existing EC2):
-ssm.send_command(InstanceIds=[existing_ec2_id], ...)
-
-# New (spin up fresh EC2):
-ec2.run_instances(
-    ImageId="ami-...",           # Amazon Linux 2023
-    InstanceType="t2.micro",
-    IamInstanceProfile={"Name": "housing-ec2-ml-profile-production"},
-    UserData="""#!/bin/bash
-        aws ecr get-login-password --region us-east-1 | docker login ...
-        docker pull <ecr_image>
-        docker run -e USE_S3=true -e S3_BUCKET=house-forecast <ecr_image>
-        sudo shutdown -h now
-    """,
-    MaxCount=1, MinCount=1
-)
-```
-
-**Free tier note:** Training EC2 runs ~30 mins/month. API EC2 runs 720 hrs/month.
-720 + 0.5 = 720.5 hrs — still under the 750 hr free tier limit.
-
-**What you'll learn:**
-- Ephemeral compute: EC2 as a job runner, not a server
-- Why `shutdown -h now` inside user_data terminates the instance after training
-- IAM instance profile allows EC2 to pull from ECR and write to S3 without credentials
-- The exact pattern GE uses for monthly part cost forecasting
-
-**Interview talking point:**
-> "Lambda is a thin trigger — it computes the run date, builds S3 paths, and launches
-> a fresh EC2. The EC2 pulls the training container from ECR, runs it, uploads the model
-> to S3, and terminates. The API instance is completely separate and unaffected."
-
----
-
-### After Week 3 — What You Can Confidently Say in Interviews
-
-```
-"My personal project mimics the production pattern I've seen in enterprise ML systems:
-
-- EventBridge schedules a monthly Lambda trigger
-- Lambda spins up an ephemeral EC2 (not a persistent server)
-- EC2 pulls a Docker image from ECR — environment is frozen and reproducible
-- Container runs hyperparameter tuning (Optuna, 15 trials, logged to MLflow)
-- Best model retrained on full data, uploaded to S3
-- EC2 terminates — no idle compute cost
-- Separate persistent EC2 serves the FastAPI inference API
-- CI/CD via GitHub Actions deploys code changes automatically
-
-I built this to understand the infrastructure, not just the models."
 ```
 
 ---
@@ -341,8 +262,15 @@ I built this to understand the infrastructure, not just the models."
 
 1. **`exclude_none=True`** in `model_dump()` is required — otherwise None-valued fields create object-dtype columns that XGBoost rejects
 2. **`df.reindex(columns=model.get_booster().feature_names)`** is required — column alignment between training schema and inference input
-3. **SSM agent** must be running on EC2 (`sudo systemctl status amazon-ssm-agent`) for CI/CD to work
+3. **SSM agent** must be running on API EC2 (`sudo systemctl status amazon-ssm-agent`) for CI/CD to work
 4. **`AWS_REGION` is reserved** in Lambda — do not set it in Terraform Lambda environment block
 5. **`terraform.tfstate`** must never be deleted — it tracks all created resources
 6. **EC2 runs independently** of your laptop — closing PyCharm does not stop the API
-7. **Free tier:** t2.micro gives 750 hrs/month = 24/7 coverage; no need to stop EC2 to stay free
+7. **Free tier:** API EC2 ~720 hrs/month + ephemeral training EC2 ~0.5 hrs/month = 720.5 hrs (under 750 hr limit)
+8. **`PYTHONUNBUFFERED=1`** must be set in Dockerfile — without it, Python buffers stdout and CloudWatch shows no logs until container exits
+9. **Ephemeral EC2 disk size**: default 8GB is too small (Docker + image + data). Always use 20GB gp3 via `BlockDeviceMappings`
+10. **Ephemeral EC2 instance type**: t2.micro (1GB RAM) causes MemoryError on large DataFrames. Use t2.small (2GB)
+11. **Git dubious ownership**: SSM runs as root but `/opt/housing-ml/app` is owned by ec2-user — always `sudo -u ec2-user git` for git commands
+12. **Lambda zip must be rebuilt** after changing `lambda_trigger.py`: run `build_zip.py`, then `terraform apply -target="aws_lambda_function.trigger_training"`
+13. **`source_code_hash`** on Lambda resource is required — without it, Terraform won't update Lambda even when the zip changes
+14. **S3 streaming**: use `pd.read_csv(response['Body'])` directly — the StringIO double-read approach causes MemoryError on large CSVs in memory-constrained containers

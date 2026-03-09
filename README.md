@@ -8,12 +8,15 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  git push → GitHub Actions → SSM → EC2 (auto-deploy)        │
+│  git push → GitHub Actions → (1) build image → push to ECR  │
+│                            → (2) SSM → EC2 (auto-deploy)    │
 └──────────────────────────────────────────────────────────────┘
 
-EventBridge (monthly) → Lambda → SSM → EC2 (auto-retrain)
+EventBridge (monthly) → Lambda → ephemeral EC2 (t2.small)
+  → docker pull ECR image → docker run training → s3 cp models → shutdown
 
-EC2 t2.micro :8000  ←→  S3 (models + data)  ←→  CloudWatch (logs)
+EC2 t2.micro :8000 (API)  ←→  S3 (models + data)  ←→  CloudWatch (logs)
+ECR: housing-ml-training (versioned Docker training images)
 ```
 
 **Live API:** `http://44.219.159.59:8000`
@@ -40,12 +43,13 @@ EC2 t2.micro :8000  ←→  S3 (models + data)  ←→  CloudWatch (logs)
 │   │   └── run_monthly.py           # Batch predictions on holdout data
 │   └── data/
 │       └── upload_to_s3.py          # Sync local models/data to S3
+├── Dockerfile                       # Training image (python:3.11-slim + AWS CLI + uv)
+├── train_entrypoint.sh              # Container entrypoint: pipeline stages + S3 upload + API restart
 ├── terraform/
-│   ├── main.tf                      # All AWS resources (EC2, S3, Lambda, IAM…)
-│   ├── user_data.sh                 # EC2 boot script
-│   ├── lambda_trigger.py            # Monthly training trigger (Lambda function)
-│   ├── build_lambda.ps1             # Package Lambda for deployment (Windows)
-│   └── build_lambda.sh              # Package Lambda for deployment (Linux/Mac)
+│   ├── main.tf                      # All AWS resources (EC2, S3, ECR, Lambda, IAM…)
+│   ├── user_data.sh                 # EC2 (API) boot script
+│   ├── lambda_trigger.py            # Monthly training trigger — launches ephemeral EC2 with Docker
+│   └── build_zip.py                 # Package Lambda for deployment (cross-platform)
 ├── tests/
 │   ├── test_features.py
 │   ├── test_training.py
@@ -56,6 +60,7 @@ EC2 t2.micro :8000  ←→  S3 (models + data)  ←→  CloudWatch (logs)
 │   ├── mlflow_config.yml
 │   └── ge_expectations.yml
 ├── scripts/
+│   ├── deploy_ec2.sh                # EC2 deploy script (sent base64-encoded via SSM)
 │   └── verify_aws_setup.py
 ├── .github/workflows/deploy.yml     # CI/CD: push to main → deploy to EC2
 ├── pyproject.toml
@@ -154,7 +159,7 @@ uv run python src/data/upload_to_s3.py
 
 ```powershell
 cd terraform
-.\build_lambda.ps1
+uv run python build_zip.py
 cd ..
 ```
 
@@ -198,7 +203,10 @@ Invoke-RestMethod http://44.219.159.59:8000/health
 
 ## CI/CD — Automatic Deployment
 
-Every push to `main` automatically deploys to EC2 via GitHub Actions + AWS SSM.
+Every push to `main` triggers two GitHub Actions jobs:
+
+1. **`build-and-push`** — builds Docker training image, pushes to ECR as `:latest` and `:<git-sha>`
+2. **`deploy`** — starts API EC2 if stopped, waits for SSM, runs `scripts/deploy_ec2.sh` via SSM
 
 **Required GitHub Secrets:**
 
@@ -206,7 +214,7 @@ Every push to `main` automatically deploys to EC2 via GitHub Actions + AWS SSM.
 |--------|-------------|
 | `AWS_ACCESS_KEY_ID` | GitHub Actions IAM user access key |
 | `AWS_SECRET_ACCESS_KEY` | GitHub Actions IAM user secret key |
-| `EC2_INSTANCE_ID` | EC2 instance ID (`i-xxxxx`) |
+| `EC2_INSTANCE_ID` | API EC2 instance ID (`i-xxxxx`) |
 | `GH_PAT` | GitHub Personal Access Token (for EC2 to pull code) |
 
 **GitHub Actions IAM user needs these permissions:**
@@ -214,30 +222,41 @@ Every push to `main` automatically deploys to EC2 via GitHub Actions + AWS SSM.
 {
   "Action": [
     "ec2:DescribeInstances", "ec2:StartInstances",
+    "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
+    "ecr:CompleteLayerUpload", "ecr:InitiateLayerUpload",
+    "ecr:PutImage", "ecr:UploadLayerPart",
     "ssm:DescribeInstanceInformation", "ssm:SendCommand",
-    "ssm:GetCommandInvocation", "ssm:ListCommandInvocations"
+    "ssm:GetCommandInvocation", "sts:GetCallerIdentity"
   ]
 }
 ```
 
 **Deploy flow:**
 ```
-push to main → start EC2 if stopped → wait for SSM → git pull + uv sync + restart service
+push to main → build Docker image → push to ECR
+             → start EC2 if stopped → wait for SSM → deploy_ec2.sh (git pull + uv sync + restart)
 ```
 
 ---
 
 ## Automated Monthly Retraining
 
-EventBridge fires on the 1st of every month at 2 AM UTC → Lambda → SSM → EC2 runs the full pipeline:
+EventBridge fires on the 1st of every month at 2 AM UTC → Lambda → fresh ephemeral EC2 (t2.small):
 
 ```
-feature pipeline → tune.py (15 Optuna trials, MLflow tracking)
-  → best params selected → model retrained → xgb_best_model.pkl
-  → uploaded to s3://house-forecast/models/production/xgb_model_latest.pkl
-  → local cache cleared → housing-ml-api restarted
-  → API startup downloads fresh tuned model from S3
-  → /predict serves inference with the new model
+Lambda: ec2.run_instances → ephemeral EC2 boots with user_data:
+  → dnf install docker + amazon-ssm-agent
+  → aws ecr get-login-password | docker login
+  → docker pull <ecr_image>:latest
+  → docker run (training container):
+      load data from S3 → preprocess → feature engineering
+      → tune.py (15 Optuna trials, MLflow tracking)
+      → best params → model retrained → xgb_best_model.pkl
+      → aws s3 cp models to s3://house-forecast/models/production/
+      → aws ssm send-command: systemctl restart housing-ml-api
+  → shutdown -h now (instance terminates)
+
+API EC2: startup downloads fresh model from S3 → /predict serves new model
 ```
 
 **S3 layout after each monthly run:**
@@ -288,7 +307,9 @@ sudo journalctl -u housing-ml-api -f
 
 | Service | Usage | Cost (free tier) | Cost (after 12 months) |
 |---------|-------|-----------------|----------------------|
-| EC2 t2.micro | 24/7 | $0 | ~$8/month |
+| EC2 t2.micro (API) | 720 hrs/month | $0 | ~$8/month |
+| EC2 t2.small (training) | ~0.5 hrs/month | $0 | ~$0.01/month |
+| ECR | ~1-2 GB image | $0 | ~$0.10/month |
 | S3 | ~500 MB | $0 | ~$0.01/month |
 | Lambda | 1/month | $0 | $0 |
 | EventBridge | 1 rule | $0 | $0 |
@@ -300,7 +321,7 @@ sudo journalctl -u housing-ml-api -f
 
 ## Key Design Decisions
 
-**EC2 + systemd (not ECS/Fargate)** — ECS/Fargate costs $30-35/month. EC2 t2.micro is free for 12 months. For a learning project, EC2 is the right choice.
+**API on EC2 + systemd; Training in Docker on ephemeral EC2** — The API runs on a persistent t2.micro (free tier). Training runs inside a Docker container on a fresh ephemeral t2.small that self-terminates — reproducible environment, no dependency drift, isolated from the API.
 
 **Time-based data splits** — Prevents data leakage. Housing prices are time-dependent; random splits would make the model look better than it actually is.
 

@@ -434,12 +434,13 @@ resource "aws_iam_role_policy_attachment" "lambda_training_policy_attach" {
 
 # Lambda function code (inline for simplicity)
 resource "aws_lambda_function" "trigger_training" {
-  filename      = "${path.module}/lambda_trigger.zip"
-  function_name = "housing-trigger-training-${var.environment}"
-  role          = aws_iam_role.lambda_training_role.arn
-  handler       = "index.handler"
-  runtime       = "python3.11"
-  timeout       = 60
+  filename         = "${path.module}/lambda_trigger.zip"
+  source_code_hash = filebase64sha256("${path.module}/lambda_trigger.zip")
+  function_name    = "housing-trigger-training-${var.environment}"
+  role             = aws_iam_role.lambda_training_role.arn
+  handler          = "index.handler"
+  runtime          = "python3.11"
+  timeout          = 60
 
   environment {
     variables = {

@@ -33,5 +33,6 @@ COPY train_entrypoint.sh ./train_entrypoint.sh
 RUN chmod +x train_entrypoint.sh
 
 ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["./train_entrypoint.sh"]

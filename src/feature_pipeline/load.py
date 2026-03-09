@@ -10,7 +10,6 @@ import os
 import pandas as pd
 from pathlib import Path
 import boto3
-from io import StringIO
 
 DATA_DIR = Path("data/raw")
 
@@ -41,12 +40,9 @@ def load_from_s3(bucket_name: str, file_key: str, region: str = None) -> pd.Data
         # Create S3 client - will use credentials from environment or ~/.aws/credentials
         s3_client = boto3.client('s3', region_name=region)
 
-        # Download file
+        # Stream directly into pandas — avoids loading the full file into memory twice
         response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
-        csv_content = response['Body'].read().decode('utf-8')
-
-        # Parse CSV
-        df = pd.read_csv(StringIO(csv_content))
+        df = pd.read_csv(response['Body'])
         print(f"✅ Loaded {len(df)} rows from S3")
 
         return df

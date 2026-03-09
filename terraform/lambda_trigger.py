@@ -41,14 +41,23 @@ def handler(event, context):
     # user_data runs as root on first boot; it pulls the image and runs training
     user_data_script = textwrap.dedent(f"""
         #!/bin/bash
-        set -e
 
-        exec > /var/log/training-boot.log 2>&1
+        # Capture all output to a log file; upload it to S3 on exit for debugging
+        LOG_FILE="/var/log/training-boot.log"
+        exec > >(tee "$LOG_FILE") 2>&1
+
+        upload_log() {{
+            aws s3 cp "$LOG_FILE" "s3://{s3_bucket}/logs/training-ephemeral-$(date +%Y%m%d-%H%M%S).log" \
+                --region {aws_region} || true
+        }}
+        trap upload_log EXIT
 
         echo "=== Ephemeral training EC2 starting at $(date) ==="
 
-        # Install Docker (Amazon Linux 2023 ships without it)
-        dnf install -y docker
+        # Install Docker and SSM agent
+        dnf install -y docker amazon-ssm-agent
+        systemctl start amazon-ssm-agent
+        systemctl enable amazon-ssm-agent
         systemctl start docker
 
         # Authenticate with ECR
@@ -56,9 +65,15 @@ def handler(event, context):
           docker login --username AWS --password-stdin {ecr_registry}
 
         # Pull and run training container
+        # --log-driver=awslogs streams container output to CloudWatch
         docker pull {ecr_image_uri}
 
         docker run --rm \\
+          --log-driver=awslogs \\
+          --log-opt awslogs-region={aws_region} \\
+          --log-opt awslogs-group=/ec2/housing-ml \\
+          --log-opt awslogs-stream=training-container \\
+          --log-opt awslogs-create-group=true \\
           -e USE_S3=true \\
           -e S3_BUCKET={s3_bucket} \\
           -e API_INSTANCE_ID={api_instance_id} \\
@@ -76,13 +91,23 @@ def handler(event, context):
     try:
         response = ec2.run_instances(
             ImageId=ami_id,
-            InstanceType='t2.micro',
+            InstanceType='t2.small',
             MinCount=1,
             MaxCount=1,
             IamInstanceProfile={'Name': instance_profile_name},
             SecurityGroupIds=[security_group_id],
             SubnetId=subnet_id,
             UserData=user_data_script,
+            BlockDeviceMappings=[
+                {
+                    'DeviceName': '/dev/xvda',
+                    'Ebs': {
+                        'VolumeSize': 20,
+                        'VolumeType': 'gp3',
+                        'DeleteOnTermination': True,
+                    },
+                }
+            ],
             TagSpecifications=[
                 {
                     'ResourceType': 'instance',

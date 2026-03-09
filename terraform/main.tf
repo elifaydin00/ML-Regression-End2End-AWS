@@ -42,6 +42,21 @@ variable "github_repo_url" {
   type        = string
 }
 
+# ECR Repository for training Docker image
+resource "aws_ecr_repository" "training" {
+  name                 = "housing-ml-training"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = {
+    Name        = "Housing ML Training Image"
+    Environment = var.environment
+  }
+}
+
 # S3 Bucket for ML artifacts
 resource "aws_s3_bucket" "ml_bucket" {
   bucket = "house-forecast"
@@ -243,6 +258,54 @@ resource "aws_iam_role_policy_attachment" "ec2_ssm_policy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# ECR pull policy — allows ephemeral training EC2 to pull the training image
+resource "aws_iam_policy" "ecr_pull_policy" {
+  name        = "housing-ecr-pull-policy-${var.environment}"
+  description = "Allow EC2 to pull training images from ECR"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ecr_policy" {
+  role       = aws_iam_role.ec2_ml_role.name
+  policy_arn = aws_iam_policy.ecr_pull_policy.arn
+}
+
+# SSM SendCommand policy — allows the training container to restart the API EC2
+resource "aws_iam_policy" "ec2_ssm_send_policy" {
+  name        = "housing-ec2-ssm-send-policy-${var.environment}"
+  description = "Allow EC2 to send SSM commands (for training container to restart API)"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:SendCommand"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ssm_send_policy" {
+  role       = aws_iam_role.ec2_ml_role.name
+  policy_arn = aws_iam_policy.ec2_ssm_send_policy.arn
+}
+
 # IAM Instance Profile for EC2
 resource "aws_iam_instance_profile" "ec2_ml_profile" {
   name = "housing-ec2-ml-profile-${var.environment}"
@@ -331,7 +394,7 @@ resource "aws_iam_role" "lambda_training_role" {
 
 resource "aws_iam_policy" "lambda_training_policy" {
   name        = "housing-lambda-training-policy-${var.environment}"
-  description = "Allow Lambda to send commands to EC2"
+  description = "Allow Lambda to launch ephemeral training EC2"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -340,11 +403,16 @@ resource "aws_iam_policy" "lambda_training_policy" {
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
-          "ec2:StartInstances",
-          "ssm:SendCommand",
-          "ssm:GetCommandInvocation"
+          "ec2:RunInstances",
+          "ec2:CreateTags"
         ]
         Resource = "*"
+      },
+      {
+        # PassRole allows Lambda to attach the EC2 instance profile to the ephemeral instance
+        Effect   = "Allow"
+        Action   = ["iam:PassRole"]
+        Resource = aws_iam_role.ec2_ml_role.arn
       },
       {
         Effect = "Allow"
@@ -375,8 +443,13 @@ resource "aws_lambda_function" "trigger_training" {
 
   environment {
     variables = {
-      INSTANCE_ID = aws_instance.ml_instance.id
-      S3_BUCKET   = aws_s3_bucket.ml_bucket.bucket
+      S3_BUCKET             = aws_s3_bucket.ml_bucket.bucket
+      ECR_IMAGE_URI         = "${aws_ecr_repository.training.repository_url}:latest"
+      INSTANCE_PROFILE_NAME = aws_iam_instance_profile.ec2_ml_profile.name
+      SECURITY_GROUP_ID     = aws_security_group.ec2_ml.id
+      SUBNET_ID             = tolist(data.aws_subnets.default.ids)[0]
+      AMI_ID                = data.aws_ami.amazon_linux_2023.id
+      API_INSTANCE_ID       = aws_instance.ml_instance.id
     }
   }
 
@@ -436,5 +509,15 @@ output "iam_role_arn" {
 output "lambda_function_name" {
   description = "Name of the Lambda function for training trigger"
   value       = aws_lambda_function.trigger_training.function_name
+}
+
+output "ecr_repository_url" {
+  description = "ECR repository URL for the training Docker image"
+  value       = aws_ecr_repository.training.repository_url
+}
+
+output "security_group_id" {
+  description = "ID of the EC2 security group"
+  value       = aws_security_group.ec2_ml.id
 }
 

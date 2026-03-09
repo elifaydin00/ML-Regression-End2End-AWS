@@ -217,6 +217,126 @@ git push origin main
 
 ---
 
+## Next Steps — Levelling Up (Docker + Ephemeral EC2)
+
+> Goal: mimic the GE Aerospace production pattern where Lambda spins up a fresh EC2,
+> runs training inside a Docker container, uploads to S3, and terminates.
+> Do these in order — each step is independently deployable and useful.
+
+---
+
+### Week 1 — Dockerise the Training Pipeline
+
+**What to build:**
+- Write a `Dockerfile` in the project root that containerises `tune.py`
+- Confirm training runs identically inside the container as it does locally
+
+**Files to create/change:**
+- `Dockerfile` (new) — base image `python:3.11-slim`, copy code, install deps via `uv`, entrypoint runs `tune.py`
+- Test locally: `docker build -t housing-ml-train . && docker run housing-ml-train`
+
+**What you'll learn:**
+- How Docker freezes an environment (why GE uses it for 1000+ parts)
+- The difference between `COPY`, `RUN`, `CMD`, `ENTRYPOINT`
+- Why `python:3.11-slim` not `python:3.11` (image size matters for pull time on EC2)
+
+**Interview talking point:**
+> "I containerised the training pipeline so the environment is identical every run —
+> same Python version, same library versions, no dependency drift between months."
+
+---
+
+### Week 2 — Push Image to ECR
+
+**What to build:**
+- Create an ECR repository via Terraform (add to `terraform/main.tf`)
+- Add a GitHub Actions job that builds and pushes the Docker image to ECR on push to main
+
+**Files to change:**
+- `terraform/main.tf` — add `aws_ecr_repository` resource
+- `.github/workflows/deploy.yml` — add build + push step before the EC2 deploy step
+
+**Commands to understand:**
+```bash
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
+docker build -t housing-ml-train .
+docker tag housing-ml-train:latest <account>.dkr.ecr.us-east-1.amazonaws.com/housing-ml-train:latest
+docker push <account>.dkr.ecr.us-east-1.amazonaws.com/housing-ml-train:latest
+```
+
+**What you'll learn:**
+- ECR is just a private Docker registry inside AWS — same as DockerHub but with IAM auth
+- Why IAM role on EC2 allows pulling from ECR without credentials
+- Image tagging strategy (`:latest` vs `:YYYY-MM` for versioning)
+
+**Interview talking point:**
+> "The training image lives in ECR. EC2 pulls it at runtime — the code and environment
+> travel together as a single versioned artifact."
+
+---
+
+### Week 3 — Lambda Spins Up Ephemeral EC2
+
+**What to build:**
+- Rewrite `terraform/lambda_trigger.py` to launch a NEW EC2 instance instead of SSM to the existing one
+- EC2 user_data: pull image from ECR, `docker run`, upload model to S3, `sudo shutdown`
+- Existing API EC2 is untouched — training and serving are fully separated
+
+**Key change in Lambda:**
+```python
+# Current (SSM to existing EC2):
+ssm.send_command(InstanceIds=[existing_ec2_id], ...)
+
+# New (spin up fresh EC2):
+ec2.run_instances(
+    ImageId="ami-...",           # Amazon Linux 2023
+    InstanceType="t2.micro",
+    IamInstanceProfile={"Name": "housing-ec2-ml-profile-production"},
+    UserData="""#!/bin/bash
+        aws ecr get-login-password --region us-east-1 | docker login ...
+        docker pull <ecr_image>
+        docker run -e USE_S3=true -e S3_BUCKET=house-forecast <ecr_image>
+        sudo shutdown -h now
+    """,
+    MaxCount=1, MinCount=1
+)
+```
+
+**Free tier note:** Training EC2 runs ~30 mins/month. API EC2 runs 720 hrs/month.
+720 + 0.5 = 720.5 hrs — still under the 750 hr free tier limit.
+
+**What you'll learn:**
+- Ephemeral compute: EC2 as a job runner, not a server
+- Why `shutdown -h now` inside user_data terminates the instance after training
+- IAM instance profile allows EC2 to pull from ECR and write to S3 without credentials
+- The exact pattern GE uses for monthly part cost forecasting
+
+**Interview talking point:**
+> "Lambda is a thin trigger — it computes the run date, builds S3 paths, and launches
+> a fresh EC2. The EC2 pulls the training container from ECR, runs it, uploads the model
+> to S3, and terminates. The API instance is completely separate and unaffected."
+
+---
+
+### After Week 3 — What You Can Confidently Say in Interviews
+
+```
+"My personal project mimics the production pattern I've seen in enterprise ML systems:
+
+- EventBridge schedules a monthly Lambda trigger
+- Lambda spins up an ephemeral EC2 (not a persistent server)
+- EC2 pulls a Docker image from ECR — environment is frozen and reproducible
+- Container runs hyperparameter tuning (Optuna, 15 trials, logged to MLflow)
+- Best model retrained on full data, uploaded to S3
+- EC2 terminates — no idle compute cost
+- Separate persistent EC2 serves the FastAPI inference API
+- CI/CD via GitHub Actions deploys code changes automatically
+
+I built this to understand the infrastructure, not just the models."
+```
+
+---
+
 ## Known Gotchas
 
 1. **`exclude_none=True`** in `model_dump()` is required — otherwise None-valued fields create object-dtype columns that XGBoost rejects

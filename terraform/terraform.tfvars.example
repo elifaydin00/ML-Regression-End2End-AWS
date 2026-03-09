@@ -1,0 +1,4 @@
+# Copy this file to terraform.tfvars and fill in your values
+# terraform.tfvars is git-ignored and should NEVER be committed
+
+github_repo_url = "https://github.com/YOUR_USERNAME/YOUR_REPO.git"

@@ -143,7 +143,7 @@ echo "Starting training pipeline at $(date)" >> /var/log/housing-ml/training.log
 
 # Upload tuned model to S3 under the key the API reads at startup
 aws s3 cp models/xgb_best_model.pkl \
-    s3://${S3_BUCKET}/models/production/xgb_model_latest.pkl >> /var/log/housing-ml/training.log 2>&1
+    s3://$${S3_BUCKET}/models/production/xgb_model_latest.pkl >> /var/log/housing-ml/training.log 2>&1
 
 # Clear local cache so API downloads fresh model on restart
 rm -f /opt/housing-ml/app/models/xgb_best_model.pkl

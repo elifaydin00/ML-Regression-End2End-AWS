@@ -59,8 +59,8 @@ SVCEOF
 
 else
   echo "=== Existing install: pulling latest code ==="
-  git -C /opt/housing-ml/app remote set-url origin "$REPO_URL"
-  git -C /opt/housing-ml/app pull origin main
+  sudo -u ec2-user git -C /opt/housing-ml/app remote set-url origin "$REPO_URL"
+  sudo -u ec2-user git -C /opt/housing-ml/app pull origin main
 fi
 
 # Sync deps (creates .venv on first run)

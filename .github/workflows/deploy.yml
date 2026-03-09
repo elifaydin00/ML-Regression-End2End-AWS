@@ -71,7 +71,7 @@ jobs:
 
       - name: Wait for SSM agent to be online
         run: |
-          for i in $(seq 1 24); do
+          for i in $(seq 1 36); do
             PING=$(aws ssm describe-instance-information \
               --filters "Key=InstanceIds,Values=${{ secrets.EC2_INSTANCE_ID }}" \
               --query 'InstanceInformationList[0].PingStatus' \
@@ -88,18 +88,89 @@ jobs:
           REPO_URL: "https://${{ secrets.GH_PAT }}@github.com/elifaydin00/ML-Regression-End2End-AWS.git"
         run: |
           python3 - << 'PYEOF'
-          import json, os
-          cmds = [
-              "git -C /opt/housing-ml/app remote set-url origin " + os.environ["REPO_URL"],
-              "git -C /opt/housing-ml/app pull origin main",
-              'sudo -u ec2-user bash -c "cd /opt/housing-ml/app && /home/ec2-user/.local/bin/uv sync --quiet"',
-              "sudo systemctl restart housing-ml-api",
-              "sleep 5",
-              "systemctl is-active housing-ml-api && echo DEPLOY_OK",
-          ]
+          import json, os, base64
+
+          repo_url = os.environ["REPO_URL"]
+
+          # This script runs on the EC2 via SSM.
+          # If /opt/housing-ml/app/.git doesn't exist it bootstraps from scratch;
+          # otherwise it does a normal git pull.
+          script = f"""#!/bin/bash
+set -e
+
+REPO_URL="{repo_url}"
+
+if [ ! -d "/opt/housing-ml/app/.git" ]; then
+  echo "=== Fresh EC2: bootstrapping ==="
+  mkdir -p /opt/housing-ml /var/log/housing-ml
+  chown ec2-user:ec2-user /opt/housing-ml /var/log/housing-ml
+
+  sudo -u ec2-user git clone "$REPO_URL" /opt/housing-ml/app
+
+  # Install uv for ec2-user if not present
+  if [ ! -f "/home/ec2-user/.local/bin/uv" ]; then
+    sudo -u ec2-user bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh"
+  fi
+
+  # run_api.sh
+  cat > /opt/housing-ml/run_api.sh << 'APIEOF'
+#!/bin/bash
+export USE_S3=true
+export S3_BUCKET=house-forecast
+export AWS_REGION=us-east-1
+export PYTHONPATH=/opt/housing-ml/app
+cd /opt/housing-ml/app
+aws s3 sync "s3://house-forecast/models/production/" models/ || true
+/opt/housing-ml/app/.venv/bin/uvicorn src.api.main:app --host 0.0.0.0 --port 8000 >> /var/log/housing-ml/api.log 2>&1
+APIEOF
+  chmod +x /opt/housing-ml/run_api.sh
+
+  # systemd service
+  cat > /etc/systemd/system/housing-ml-api.service << 'SVCEOF'
+[Unit]
+Description=Housing ML FastAPI Service
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/housing-ml
+Environment="USE_S3=true"
+Environment="S3_BUCKET=house-forecast"
+Environment="AWS_REGION=us-east-1"
+Environment="PYTHONPATH=/opt/housing-ml/app"
+ExecStart=/opt/housing-ml/run_api.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+  systemctl daemon-reload
+  systemctl enable housing-ml-api
+  echo "=== Bootstrap complete ==="
+
+else
+  echo "=== Existing install: pulling latest code ==="
+  git -C /opt/housing-ml/app remote set-url origin "$REPO_URL"
+  git -C /opt/housing-ml/app pull origin main
+fi
+
+# Sync deps (creates .venv on first run)
+sudo -u ec2-user bash -c "cd /opt/housing-ml/app && /home/ec2-user/.local/bin/uv sync --quiet"
+
+# Start or restart the API
+systemctl restart housing-ml-api
+sleep 5
+systemctl is-active housing-ml-api && echo DEPLOY_OK
+"""
+
+          encoded = base64.b64encode(script.encode()).decode()
+          # SSM receives a single command: decode the script and run it
+          cmds = [f"echo '{encoded}' | base64 -d | bash"]
           with open("/tmp/cmds.json", "w") as f:
               json.dump({"commands": cmds}, f)
-          print("Deploy commands prepared")
+          print("Deploy script prepared")
           PYEOF
 
           COMMAND_ID=$(aws ssm send-command \
@@ -116,13 +187,14 @@ jobs:
         run: |
           ID="${{ steps.deploy.outputs.command_id }}"
           INSTANCE="${{ secrets.EC2_INSTANCE_ID }}"
-          for i in $(seq 1 30); do
+          # 60 attempts × 10s = 10 min (covers bootstrap + normal deploy)
+          for i in $(seq 1 60); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$ID" \
               --instance-id "$INSTANCE" \
               --query 'Status' \
               --output text 2>/dev/null || echo "Pending")
-            echo "Deployment status: $STATUS (attempt $i/30)"
+            echo "Deployment status: $STATUS (attempt $i/60)"
             if [ "$STATUS" = "Success" ]; then
               echo "--- Output ---"
               aws ssm get-command-invocation \

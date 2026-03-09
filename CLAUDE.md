@@ -20,8 +20,8 @@
 ## Live Infrastructure
 
 | Resource | Value |
-|----------|-------|
-| EC2 Instance | `i-05ac00076131b6a09` |
+|----------|------|
+| EC2 Instance | `i-0be34b1d7f2933e29` |
 | EC2 Public IP | `44.219.159.59` (Elastic IP — permanent) |
 | API URL | `http://44.219.159.59:8000` |
 | S3 Bucket | `house-forecast` |

@@ -6,6 +6,8 @@
 
 ## Architecture
 
+![Architecture Diagram](architecture.png)
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  git push → GitHub Actions → (1) build image → push to ECR  │
@@ -18,6 +20,13 @@ EventBridge (monthly) → Lambda → ephemeral EC2 (t2.small)
 EC2 t2.micro :8000 (API)  ←→  S3 (models + data)  ←→  CloudWatch (logs)
 ECR: housing-ml-training (versioned Docker training images)
 ```
+
+### Deployment Paths
+
+| Component | Runtime | How Deployed |
+|-----------|---------|-------------|
+| Training pipeline | Docker container on ephemeral EC2 (t2.small) | Lambda → `ec2.run_instances` → pulls ECR image, self-terminates after training |
+| FastAPI API | Bare Python (uv) + systemd on persistent EC2 (t2.micro) | GitHub Actions → SSM → `scripts/deploy_ec2.sh` (git pull + uv sync + restart) |
 
 **Live API:** `http://44.219.159.59:8000`
 

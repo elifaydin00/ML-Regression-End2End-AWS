@@ -7,6 +7,7 @@
 ## Architecture
 
 ![Architecture Diagram](architecture.png)
+<img width="7280" height="4240" alt="image" src="https://github.com/user-attachments/assets/2e4b026b-24a1-449a-b55e-180495bdbdc2" />
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
